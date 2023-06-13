@@ -52,7 +52,8 @@
 
 #include <plist/plist.h>
 
-#include <zip.h>
+#include <archive.h>
+#include <archive_entry.h>
 
 #ifdef WIN32
 #include <windows.h>
@@ -276,61 +277,86 @@ static void status_cb(plist_t command, plist_t status, void *unused)
 	}
 }
 
-static int zip_get_contents(struct zip *zf, const char *filename, int locate_flags, char **buffer, uint32_t *len)
+la_int64_t zip_name_locate(struct archive *a, const char *filename, int locate_flags) {
+	struct archive_entry *entry;
+	int err;
+	while ((err = archive_read_next_header(a, &entry)) == ARCHIVE_OK) {
+		const char *name = archive_entry_pathname(entry);
+		if (strcmp(filename, name) == 0) {
+			return archive_read_header_position(a);
+		}
+	}
+	return -1;
+}
+
+static int zip_get_contents(const char *archive_name, const char *filename, int locate_flags, char **buffer, uint32_t *len)
 {
-	struct zip_stat zs;
-	struct zip_file *zfile;
-	int zindex = zip_name_locate(zf, filename, locate_flags);
+	int err;
+	struct archive *a;
+	struct archive_entry *entry;
+
+	a = archive_read_new();
+	archive_read_support_filter_all(a);
+	archive_read_support_format_all(a);
+	err = archive_read_open_filename(a, archive_name, 1024*1024);
+	if (err != ARCHIVE_OK) {
+		archive_read_free(a);
+		return -1;
+	}
+
+	while ((err = archive_read_next_header(a, &entry)) == ARCHIVE_OK) {
+		const char *name = archive_entry_pathname(entry);
+		if (strcmp(filename, name) == 0) {
+			break;
+		}
+	}
+
+	if (err != ARCHIVE_OK) {
+		archive_read_free(a);
+		return -1;
+	}
 
 	*buffer = NULL;
 	*len = 0;
 
-	if (zindex < 0) {
-		return -1;
-	}
-
-	zip_stat_init(&zs);
-
-	if (zip_stat_index(zf, zindex, 0, &zs) != 0) {
-		fprintf(stderr, "ERROR: zip_stat_index '%s' failed!\n", filename);
-		return -2;
-	}
-
-	if (zs.size > 10485760) {
+	la_ssize_t entry_size = archive_entry_size(entry);
+	if (entry_size > 10485760) {
 		fprintf(stderr, "ERROR: file '%s' is too large!\n", filename);
 		return -3;
 	}
 
-	zfile = zip_fopen_index(zf, zindex, 0);
-	if (!zfile) {
-		fprintf(stderr, "ERROR: zip_fopen '%s' failed!\n", filename);
-		return -4;
-	}
-
-	*buffer = malloc(zs.size);
-	if (zs.size > LLONG_MAX || zip_fread(zfile, *buffer, zs.size) != (zip_int64_t)zs.size) {
-		fprintf(stderr, "ERROR: zip_fread %" PRIu64 " bytes from '%s'\n", (uint64_t)zs.size, filename);
+	*buffer = malloc(entry_size);
+	if (entry_size > LLONG_MAX || archive_read_data(a, *buffer, entry_size) != entry_size) {
+		fprintf(stderr, "ERROR: zip_fread %" PRIu64 " bytes from '%s'\n", (uint64_t)entry_size, filename);
 		free(*buffer);
 		*buffer = NULL;
-		zip_fclose(zfile);
 		return -5;
 	}
-	*len = zs.size;
-	zip_fclose(zfile);
+	*len = entry_size;
+	archive_read_free(a);
 	return 0;
 }
 
-static int zip_get_app_directory(struct zip* zf, char** path)
+static int zip_get_app_directory(const char *archive_name, char** path)
 {
-	int i = 0;
-	int c = zip_get_num_files(zf);
-	int len = 0;
+	int err;
+	struct archive *a;
+	struct archive_entry *entry;
 	const char* name = NULL;
+	size_t len;
+
+	a = archive_read_new();
+	archive_read_support_filter_all(a);
+	archive_read_support_format_all(a);
+	err = archive_read_open_filename(a, archive_name, 1024*1024);
+	if (err != ARCHIVE_OK) {
+		archive_read_free(a);
+		return -1;
+	}
 
 	/* look through all filenames in the archive */
-	do {
-		/* get filename at current index */
-		name = zip_get_name(zf, i++, 0);
+	while ((err = archive_read_next_header(a, &entry)) == ARCHIVE_OK) {
+		name = archive_entry_pathname(entry);
 		if (name != NULL) {
 			/* check if we have a "Payload/.../" name */
 			len = strlen(name);
@@ -368,12 +394,14 @@ static int zip_get_app_directory(struct zip* zf, char** path)
 				break;
 			}
 		}
-	} while(i < c);
+	}
 
 	if (*path == NULL) {
+		archive_read_free(a);
 		return -1;
 	}
 
+	archive_read_free(a);
 	return 0;
 }
 
@@ -990,14 +1018,14 @@ run_again:
 
 		plist_t client_opts = instproxy_client_options_new();
 
-		/* open install package */
-		int errp = 0;
-		struct zip *zf = NULL;
-
 		if ((strlen(cmdarg) > 5) && (strcmp(&cmdarg[strlen(cmdarg)-5], ".ipcc") == 0)) {
-			zf = zip_open(cmdarg, 0, &errp);
-			if (!zf) {
-				fprintf(stderr, "ERROR: zip_open: %s: %d\n", cmdarg, errp);
+			int aerr;
+			struct archive *a;
+			struct archive_entry *entry;
+			a = archive_read_new();
+			aerr = archive_read_open_filename(a, cmdarg, 10240);
+			if (aerr != ARCHIVE_OK) {
+				fprintf(stderr, "ERROR: zip_open: %s: %d\n", cmdarg, aerr);
 				goto leave_cleanup;
 			}
 
@@ -1009,10 +1037,8 @@ run_again:
 			printf("Uploading %s package contents... ", basename(ipcc));
 
 			/* extract the contents of the .ipcc file to PublicStaging/<name>.ipcc directory */
-			zip_uint64_t numzf = zip_get_num_entries(zf, 0);
-			zip_uint64_t i = 0;
-			for (i = 0; numzf > 0 && i < numzf; i++) {
-				const char* zname = zip_get_name(zf, i, 0);
+			while ((aerr = archive_read_next_header(a, &entry)) == ARCHIVE_OK) {
+				const char* zname = archive_entry_pathname(entry);
 				char* dstpath = NULL;
 				if (!zname) continue;
 				if (zname[strlen(zname)-1] == '/') {
@@ -1023,33 +1049,21 @@ run_again:
 					dstpath = NULL;
 				} else {
 					// file
-					struct zip_file* zfile = zip_fopen_index(zf, i, 0);
-					if (!zfile) continue;
 
 					if ((asprintf(&dstpath, "%s/%s/%s", PKG_PATH, basename(ipcc), zname) <= 0) || !dstpath || (afc_file_open(afc, dstpath, AFC_FOPEN_WRONLY, &af) != AFC_E_SUCCESS)) {
 						fprintf(stderr, "ERROR: can't open afc://%s for writing\n", dstpath);
 						free(dstpath);
 						dstpath = NULL;
-						zip_fclose(zfile);
-						continue;
-					}
-
-					struct zip_stat zs;
-					zip_stat_init(&zs);
-					if (zip_stat_index(zf, i, 0, &zs) != 0) {
-						fprintf(stderr, "ERROR: zip_stat_index %" PRIu64 " failed!\n", i);
-						free(dstpath);
-						dstpath = NULL;
-						zip_fclose(zfile);
 						continue;
 					}
 
 					free(dstpath);
 					dstpath = NULL;
 
-					zip_uint64_t zfsize = 0;
-					while (zfsize < zs.size) {
-						zip_int64_t amount = zip_fread(zfile, buf, sizeof(buf));
+					size_t zfsize = 0;
+					size_t entry_size = archive_entry_size(entry);
+					while (zfsize < entry_size) {
+						size_t amount = archive_read_data(a, buf, sizeof(buf));
 						if (amount == 0) {
 							break;
 						}
@@ -1066,9 +1080,8 @@ run_again:
 								total += written;
 							}
 							if (total != amount) {
-								fprintf(stderr, "Error: wrote only %d of %" PRIi64 "\n", total, amount);
+								fprintf(stderr, "Error: wrote only %d of %zu\n", total, amount);
 								afc_file_close(afc, af);
-								zip_fclose(zfile);
 								free(dstpath);
 								goto leave_cleanup;
 							}
@@ -1080,10 +1093,10 @@ run_again:
 					afc_file_close(afc, af);
 					af = 0;
 
-					zip_fclose(zfile);
 				}
 			}
 			free(ipcc);
+			archive_read_free(a);
 			printf("DONE.\n");
 
 			instproxy_client_options_add(client_opts, "PackageType", "CarrierBundle", NULL);
@@ -1146,17 +1159,11 @@ run_again:
 			plist_free(info);
 			info = NULL;
 		} else {
-			zf = zip_open(cmdarg, 0, &errp);
-			if (!zf) {
-				fprintf(stderr, "ERROR: zip_open: %s: %d\n", cmdarg, errp);
-				goto leave_cleanup;
-			}
-
 			/* extract iTunesMetadata.plist from package */
 			char *zbuf = NULL;
 			uint32_t len = 0;
 			plist_t meta_dict = NULL;
-			if (zip_get_contents(zf, ITUNES_METADATA_PLIST_FILENAME, 0, &zbuf, &len) == 0) {
+			if (zip_get_contents(cmdarg, ITUNES_METADATA_PLIST_FILENAME, 0, &zbuf, &len) == 0) {
 				meta = plist_new_data(zbuf, len);
 				if (memcmp(zbuf, "bplist00", 8) == 0) {
 					plist_from_bin(zbuf, len, &meta_dict);
@@ -1175,7 +1182,7 @@ run_again:
 			char* filename = NULL;
 			char* app_directory_name = NULL;
 
-			if (zip_get_app_directory(zf, &app_directory_name)) {
+			if (zip_get_app_directory(cmdarg, &app_directory_name)) {
 				fprintf(stderr, "ERROR: Unable to locate .app directory in archive. Make sure it is inside a 'Payload' directory.\n");
 				goto leave_cleanup;
 			}
@@ -1187,11 +1194,9 @@ run_again:
 			app_directory_name = NULL;
 			strcat(filename, "Info.plist");
 
-			if (zip_get_contents(zf, filename, 0, &zbuf, &len) < 0) {
+			if (zip_get_contents(cmdarg, filename, 0, &zbuf, &len) < 0) {
 				fprintf(stderr, "WARNING: could not locate %s in archive!\n", filename);
 				free(filename);
-				zip_unchange_all(zf);
-				zip_close(zf);
 				goto leave_cleanup;
 			}
 			free(filename);
@@ -1204,8 +1209,6 @@ run_again:
 
 			if (!info) {
 				fprintf(stderr, "Could not parse Info.plist!\n");
-				zip_unchange_all(zf);
-				zip_close(zf);
 				goto leave_cleanup;
 			}
 
@@ -1225,8 +1228,6 @@ run_again:
 
 			if (!bundleexecutable) {
 				fprintf(stderr, "Could not determine value for CFBundleExecutable!\n");
-				zip_unchange_all(zf);
-				zip_close(zf);
 				goto leave_cleanup;
 			}
 
@@ -1240,7 +1241,7 @@ run_again:
 			/* extract .sinf from package */
 			zbuf = NULL;
 			len = 0;
-			if (zip_get_contents(zf, sinfname, 0, &zbuf, &len) == 0) {
+			if (zip_get_contents(cmdarg, sinfname, 0, &zbuf, &len) == 0) {
 				sinf = plist_new_data(zbuf, len);
 			} else {
 				fprintf(stderr, "WARNING: could not locate %s in archive!\n", sinfname);
@@ -1274,10 +1275,6 @@ run_again:
 			if (meta) {
 				instproxy_client_options_add(client_opts, "iTunesMetadata", meta, NULL);
 			}
-		}
-		if (zf) {
-			zip_unchange_all(zf);
-			zip_close(zf);
 		}
 
 		/* perform installation or upgrade */

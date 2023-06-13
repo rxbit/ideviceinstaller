@@ -22,7 +22,7 @@ LT_INIT
 # Checks for libraries.
 PKG_CHECK_MODULES(libimobiledevice, libimobiledevice-1.0 >= 1.3.0)
 PKG_CHECK_MODULES(libplist, libplist-2.0 >= 2.3.0)
-PKG_CHECK_MODULES(libzip, libzip >= 0.10)
+PKG_CHECK_MODULES(libarchive, libarchive >=  3.6.0)
 
 # Checks for header files.
 AC_HEADER_STDC
